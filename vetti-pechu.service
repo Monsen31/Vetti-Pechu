@@ -1,0 +1,16 @@
+[Unit]
+Description=Vetti Pechu Discord bot (Claude)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/vetti-pechu
+EnvironmentFile=/home/ubuntu/vetti-pechu/.env
+ExecStart=/home/ubuntu/vetti-pechu/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
