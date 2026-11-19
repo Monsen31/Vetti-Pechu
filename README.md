@@ -150,11 +150,12 @@ All settings live in `.env`. Restart the service after any change.
 - **Personality:** the default persona is a laid-back, chatty friend. To change it, uncomment `SYSTEM_PROMPT=` and write your own, e.g. `SYSTEM_PROMPT=You are Vetti Pechu, the sarcastic but kind friend in our group chat. Keep replies to one or two sentences.`
 - **Name:** defaults to Vetti Pechu. To change it, set `BOT_NAME=Jarvis` (also rename the app in the Discord Developer Portal so the display name matches).
 - **Memory:** `HISTORY_LIMIT=40` lets it read further back. More history means slightly higher cost per reply.
+- **Web browsing:** on by default. The bot searches the web and reads links when someone asks about news, scores, prices or anything recent, and adds its sources under the reply. Set `WEB_BROWSING=off` to turn it off. `WEB_MAX_SEARCHES` (default 3) and `WEB_MAX_PAGE_READS` (default 2) cap how much it does per reply. If it never searches, check that web search is allowed for your organisation at **console.anthropic.com > Settings**.
 - **Smarter model:** `CLAUDE_MODEL=claude-sonnet-5-5` gives noticeably better answers at roughly 20 times the cost of Haiku (still only pence a day for a small group).
 
 ## What it costs
 
-Haiku 5.5 is priced at $0.10 per million input tokens and $0.50 per million output tokens. Each reply sends the last 20 messages (roughly 500 to 1,500 tokens) and gets a short answer back, so a reply costs a small fraction of a penny. Even 100 mentions a day comes to well under £1 a month. Your spend limit from Step 1 is the safety net either way. You can watch usage at **console.anthropic.com > Usage**.
+Haiku 5.5 is priced at $0.10 per million input tokens and $0.50 per million output tokens. Each reply sends the last 20 messages (roughly 500 to 1,500 tokens) and gets a short answer back, so a reply costs a small fraction of a penny. Even 100 mentions a day comes to well under £1 a month. Web searches cost an extra $0.01 each (about 1p), plus the tokens for what it reads, and the bot only searches when a question needs it. Your spend limit from Step 1 is the safety net either way. You can watch usage at **console.anthropic.com > Usage**.
 
 ## Troubleshooting
 

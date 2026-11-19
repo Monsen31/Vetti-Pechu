@@ -22,6 +22,12 @@ MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 BOT_NAME = os.getenv("BOT_NAME", "Vetti Pechu")
 
+# Web browsing: lets the bot search the web and read pages for fresh info.
+# Each web search costs $0.01 (on top of tokens), so the caps keep it cheap.
+WEB_BROWSING = os.getenv("WEB_BROWSING", "on").lower() in ("on", "true", "yes", "1")
+WEB_MAX_SEARCHES = int(os.getenv("WEB_MAX_SEARCHES", "3"))  # per reply
+WEB_MAX_PAGE_READS = int(os.getenv("WEB_MAX_PAGE_READS", "2"))  # per reply
+
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     f"You are {BOT_NAME}, one of the friends in a casual Discord group chat. "
@@ -33,6 +39,26 @@ SYSTEM_PROMPT = os.getenv(
     "short, natural and warm, usually one to three sentences. "
     "Don't start your reply with your own name. Use Discord markdown sparingly.",
 )
+
+if WEB_BROWSING:
+    SYSTEM_PROMPT += (
+        " You can search the web and read web pages. Use them when someone asks "
+        "about news, scores, prices, weather, recent events, or anything you're "
+        "not sure is still true, or when someone shares a link. Don't search for "
+        "casual chat. Give the answer in your own words; don't paste long quotes."
+    )
+
+WEB_TOOLS = [
+    # Haiku uses these versions of the server-side web tools.
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": WEB_MAX_SEARCHES},
+    {
+        "type": "web_fetch_20250910",
+        "name": "web_fetch",
+        "max_uses": WEB_MAX_PAGE_READS,
+        "max_content_tokens": 8000,  # caps how much of a page it reads
+    },
+]
+MAX_SOURCES = 3
 
 DISCORD_MAX_CHARS = 2000
 
@@ -65,19 +91,49 @@ async def build_transcript(channel) -> str:
     return "\n".join(lines)
 
 
+def source_links(content) -> list[str]:
+    """Collect the web pages Claude cited, so friends can check them."""
+    urls = []
+    for block in content:
+        for c in getattr(block, "citations", None) or []:
+            url = getattr(c, "url", None)
+            if url and url not in urls:
+                urls.append(url)
+    return urls[:MAX_SOURCES]
+
+
 async def ask_claude(transcript: str) -> str:
-    response = await claude.messages.create(
+    messages = [{"role": "user", "content": transcript}]
+    request = dict(
         model=MODEL,
-        max_tokens=1024,
+        max_tokens=2048,
         system=SYSTEM_PROMPT,
         output_config={"effort": "low"},  # chat doesn't need deep thinking; keeps it cheap and fast
-        messages=[{"role": "user", "content": transcript}],
     )
+    if WEB_BROWSING:
+        request["tools"] = WEB_TOOLS
+
+    response = await claude.messages.create(messages=messages, **request)
+    content = list(response.content)
+    # A long web lookup can pause partway; send it back so it can carry on.
+    for _ in range(3):
+        if response.stop_reason != "pause_turn":
+            break
+        resume = messages + [{"role": "assistant", "content": content}]
+        response = await claude.messages.create(messages=resume, **request)
+        content += response.content
+
     if response.stop_reason == "refusal":
         return "I'd rather not weigh in on that one."
-    # The reply can include thinking blocks; keep only the text.
-    text = "".join(b.text for b in response.content if b.type == "text").strip()
-    return text or "🤔"
+    # Keep only the text (the reply can also hold thinking and web results).
+    text = "".join(b.text for b in content if b.type == "text").strip()
+    if not text:
+        return "🤔"
+    sources = source_links(content)
+    if sources:
+        # <...> stops Discord from showing a big preview for each link.
+        text += "\n-# Sources: " + " · ".join(f"<{u}>" for u in sources)
+    return text
 
 
 def split_for_discord(text: str) -> list[str]:
@@ -102,7 +158,7 @@ def is_for_me(msg: discord.Message) -> bool:
 
 @bot.event
 async def on_ready():
-    log.info("Logged in as %s. Mention me in a channel to chat.", bot.user)
+    log.info("Logged in as %s. Web browsing is %s.", bot.user, "on" if WEB_BROWSING else "off")
 
 
 @bot.event
