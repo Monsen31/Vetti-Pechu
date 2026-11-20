@@ -153,6 +153,7 @@ All settings live in `.env`. Restart the service after any change.
 - **@everyone and @here:** the bot also replies when someone pings `@everyone` or `@here`. Set `REPLY_TO_EVERYONE=off` to only reply when it is mentioned directly.
 - **Memory:** the bot remembers who is in the chat and facts people share (nicknames, birthdays, teams, plans), even after they scroll out of the last 20 messages. Ask it to forget something and it will. Everything is kept in `memory.json` next to `bot.py`; delete that file to wipe its memory, or set `MEMORY=off`.
 - **Web browsing:** on by default. The bot searches the web and reads links when someone asks about news, scores, prices or anything recent, and adds its sources under the reply. Set `WEB_BROWSING=off` to turn it off. `WEB_MAX_SEARCHES` (default 3) and `WEB_MAX_PAGE_READS` (default 2) cap how much it does per reply. If it never searches, check that web search is allowed for your organisation at **console.anthropic.com > Settings**.
+- **Free option (Groq):** set `PROVIDER=groq` and `GROQ_API_KEY=gsk_...` (from console.groq.com > API Keys) to answer with Groq's free tier instead of Claude. Memory and @everyone still work; web browsing doesn't. Change the model with `GROQ_MODEL` (default `llama-3.3-70b-versatile`; see console.groq.com/docs/models). Set `PROVIDER=claude` to switch back.
 - **Smarter model:** `CLAUDE_MODEL=claude-sonnet-5-5` gives noticeably better answers at roughly 20 times the cost of Haiku (still only pence a day for a small group).
 
 ## What it costs

@@ -14,19 +14,26 @@ from pathlib import Path
 
 import anthropic
 import discord
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv()  # reads the .env file next to this script
 
 # ---- Settings (change these in .env, not here) -------------------------
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+# Which AI answers: "claude" (default) or "groq" (free tier, no web browsing).
+PROVIDER = os.getenv("PROVIDER", "claude").strip().lower()
 MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 BOT_NAME = os.getenv("BOT_NAME", "Vetti Pechu")
 
 # Web browsing: lets the bot search the web and read pages for fresh info.
 # Each web search costs $0.01 (on top of tokens), so the caps keep it cheap.
 WEB_BROWSING = os.getenv("WEB_BROWSING", "on").lower() in ("on", "true", "yes", "1")
+WEB_BROWSING = WEB_BROWSING and PROVIDER == "claude"  # web tools are Claude-only
 WEB_MAX_SEARCHES = int(os.getenv("WEB_MAX_SEARCHES", "3"))  # per reply
 WEB_MAX_PAGE_READS = int(os.getenv("WEB_MAX_PAGE_READS", "2"))  # per reply
 
@@ -116,9 +123,15 @@ DISCORD_MAX_CHARS = 2000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vetti-pechu")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # quieter logs
 
 # ANTHROPIC_API_KEY is picked up from the environment automatically.
-claude = anthropic.AsyncAnthropic()
+if PROVIDER not in ("claude", "groq"):
+    raise SystemExit(f"Unknown PROVIDER={PROVIDER!r}; use claude or groq")
+if PROVIDER == "groq" and not GROQ_API_KEY:
+    raise SystemExit("PROVIDER=groq but GROQ_API_KEY is missing from .env")
+claude = anthropic.AsyncAnthropic() if PROVIDER == "claude" else None
+groq = httpx.AsyncClient(timeout=60) if PROVIDER == "groq" else None
 
 intents = discord.Intents.default()
 intents.message_content = True  # must also be switched on in the Developer Portal
@@ -235,27 +248,79 @@ def add_assistant(messages: list, content) -> None:
         messages.append({"role": "assistant", "content": list(content)})
 
 
-def run_memory_tool(key: str, block) -> dict:
-    args = block.input if isinstance(block.input, dict) else {}
+def run_memory_tool(key: str, name: str, args) -> tuple[str, bool]:
+    """Run remember/forget. Returns (result text, is_error)."""
+    args = args if isinstance(args, dict) else {}
     person, fact = str(args.get("person", "")), str(args.get("fact", ""))
     if not memory or not person or not fact:
         result, error = "Missing person or fact.", True
-    elif block.name == "remember":
+    elif name == "remember":
         result, error = memory.remember(key, person, fact), False
-    elif block.name == "forget":
+    elif name == "forget":
         result, error = memory.forget(key, person, fact), False
     else:
-        result, error = f"Unknown tool {block.name}", True
-    log.info("Memory %s: %s", block.name, result)
-    return {"type": "tool_result", "tool_use_id": block.id, "content": result, "is_error": error}
+        result, error = f"Unknown tool {name}", True
+    log.info("Memory %s: %s", name, result)
+    return result, error
 
 
-async def ask_claude(transcript: str, key: str) -> str:
-    prompt = transcript
+def build_prompt(transcript: str, key: str) -> str:
     if memory:
         known = memory.summary(key)
         if known:
-            prompt = f"<memory>\n{known}\n</memory>\n\nRecent chat:\n{transcript}"
+            return f"<memory>\n{known}\n</memory>\n\nRecent chat:\n{transcript}"
+    return transcript
+
+
+async def ask(transcript: str, key: str) -> str:
+    prompt = build_prompt(transcript, key)
+    if PROVIDER == "groq":
+        return await ask_groq(prompt, key)
+    return await ask_claude(prompt, key)
+
+
+async def ask_groq(prompt: str, key: str) -> str:
+    """Groq's free API (OpenAI-style). Supports memory tools, not web browsing."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+    body = {"model": GROQ_MODEL, "max_tokens": 1024, "temperature": 0.8}
+    if memory:
+        body["tools"] = [
+            {"type": "function", "function": {
+                "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
+            for t in MEMORY_TOOLS
+        ]
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+
+    for _ in range(4):
+        r = await groq.post(GROQ_URL, json={**body, "messages": messages}, headers=headers)
+        if r.status_code == 429:
+            log.warning("Groq rate limit: %s", r.text[:300])
+            return "I've hit my free limit for now. Give me a minute and try again."
+        if r.status_code == 401:
+            log.error("Groq API key is wrong. Check GROQ_API_KEY in .env")
+            return "My Groq key isn't working. Ask whoever runs me to check it."
+        if r.status_code >= 400:
+            log.error("Groq error %s: %s", r.status_code, r.text[:500])
+            return "Something went wrong on my end. Try again later."
+        data = r.json()
+        msg = data["choices"][0]["message"]
+        usage = data.get("usage", {})
+        log.info("Reply (groq): in=%s out=%s", usage.get("prompt_tokens"), usage.get("completion_tokens"))
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            return (msg.get("content") or "").strip() or "🤔"
+        messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
+        for call in calls:
+            try:
+                args = json.loads(call["function"].get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            result, _ = run_memory_tool(key, call["function"]["name"], args)
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+    return "👍"
+
+
+async def ask_claude(prompt: str, key: str) -> str:
     messages = [{"role": "user", "content": prompt}]
     tools = (WEB_TOOLS if WEB_BROWSING else []) + (MEMORY_TOOLS if memory else [])
     request = dict(
@@ -279,7 +344,12 @@ async def ask_claude(transcript: str, key: str) -> str:
             add_assistant(messages, response.content)
         elif response.stop_reason == "tool_use":
             add_assistant(messages, response.content)
-            results = [run_memory_tool(key, b) for b in response.content if b.type == "tool_use"]
+            results = []
+            for b in response.content:
+                if b.type == "tool_use":
+                    result, error = run_memory_tool(key, b.name, b.input)
+                    results.append({"type": "tool_result", "tool_use_id": b.id,
+                                    "content": result, "is_error": error})
             messages.append({"role": "user", "content": results})
         else:
             break
@@ -334,7 +404,8 @@ def is_for_me(msg: discord.Message) -> bool:
 
 @bot.event
 async def on_ready():
-    log.info("Logged in as %s. Web browsing is %s. Memory is %s.", bot.user,
+    log.info("Logged in as %s. AI: %s. Web browsing is %s. Memory is %s.", bot.user,
+             f"Groq ({GROQ_MODEL})" if PROVIDER == "groq" else f"Claude ({MODEL})",
              "on" if WEB_BROWSING else "off", f"on ({MEMORY_FILE})" if memory else "off")
 
 
@@ -346,7 +417,7 @@ async def on_message(msg: discord.Message):
     try:
         async with msg.channel.typing():
             transcript = await build_transcript(msg.channel)
-            reply = await ask_claude(transcript, chat_key(msg.channel))
+            reply = await ask(transcript, chat_key(msg.channel))
     except anthropic.RateLimitError:
         log.warning("Rate limited by the Claude API")
         reply = "I'm getting a lot of messages right now. Try me again in a minute."
