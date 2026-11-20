@@ -143,6 +143,23 @@ You should see **active (running)** in green. You can now close the terminal; th
 
 ---
 
+## Slash commands (for everyone in the server)
+
+| Command | What it does |
+|---|---|
+| `/ask question:` | Ask the bot something. You can attach a picture too. |
+| `/persona pick` | Pick a fun style: angry chef, big-talk president, Kollywood hero, football commentator, posh butler, pirate, Shakespeare |
+| `/persona custom description:` | Make up your own, e.g. "a grumpy cat who secretly loves everyone" |
+| `/persona default` | Back to normal |
+| `/persona show` | See which style is on |
+| `/reset` | Forget the conversation in this channel, the saved names and facts, or everything |
+
+The style is saved per server, so it stays after restarts. You can still just @mention the bot as before.
+
+**Pictures:** attach an image when you mention the bot (or reply to a message with a picture) and it will look at it. With Claude this uses the same model; with Groq it uses `GROQ_VISION_MODEL` (default `qwen/qwen3.8-27b`). Images over 5 MB are skipped. Set `IMAGES=off` to turn this off.
+
+**If the slash commands don't appear:** re-invite the bot. In the Discord Developer Portal, open **OAuth2 > URL Generator**, tick `bot` and `applications.commands`, tick the same permissions as before, open the URL and pick your server. You don't need to remove the bot first.
+
 ## Customising
 
 All settings live in `.env`. Restart the service after any change.

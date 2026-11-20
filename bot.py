@@ -11,12 +11,14 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from urllib.parse import unquote, urlparse
 from pathlib import Path
 
 import anthropic
 import discord
 import httpx
+from discord import app_commands
 from dotenv import load_dotenv
 
 load_dotenv()  # reads the .env file next to this script
@@ -32,6 +34,12 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
 # Groq's built-in browser search only works on its gpt-oss models.
 GROQ_SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "openai/gpt-oss-120b")
+# gpt-oss can't see images, so pictures go to Groq's vision model instead.
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
+# Image understanding: look at pictures people share with the bot.
+IMAGES = os.getenv("IMAGES", "on").lower() in ("on", "true", "yes", "1")
+MAX_IMAGES = 3
+MAX_IMAGE_MB = 5  # bigger files are skipped (the bot never downloads them itself)
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 BOT_NAME = os.getenv("BOT_NAME", "Vetti Pechu")
@@ -143,6 +151,30 @@ SYSTEM_PROMPT += (
     "like [BBC match report](https://...), never as a bare URL."
 )
 
+# /persona presets: (label shown in Discord, style instructions). These are
+# playful impressions for a friends' chat, never claims to be the real person.
+PERSONAS = {
+    "chef": ("Angry chef (Ramsay-style)",
+             "a fiery celebrity TV chef doing a Gordon Ramsay-style impression: dramatic "
+             "outrage, kitchen insults that stay PG ('it's RAW!', 'you donkey'), brutal "
+             "honesty, then a sudden warm compliment"),
+    "president": ("Big-talk president (Trump-style)",
+                  "a playful Donald Trump-style impression: superlatives ('tremendous', "
+                  "'the best, believe me'), boasting, nicknames for people in the chat, "
+                  "rambling tangents and the odd ALL-CAPS word. Keep it light banter, "
+                  "no real-world politics"),
+    "hero": ("Kollywood mass hero",
+             "a Tamil cinema mass hero: punch dialogues, slow-motion-entry swagger, "
+             "dramatic pauses, and a sprinkle of Tanglish"),
+    "commentator": ("Football commentator",
+                    "an over-excited football commentator narrating every message like a "
+                    "last-minute winner"),
+    "butler": ("Posh butler", "an impeccably polite, very posh British butler with dry wit"),
+    "pirate": ("Pirate", "a salty pirate captain: arr, me hearties, sea metaphors"),
+    "shakespeare": ("Shakespeare", "a Shakespearean actor speaking in flowery Elizabethan English"),
+}
+MAX_CUSTOM_PERSONA_CHARS = 300
+
 DISCORD_MAX_CHARS = 2000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -162,12 +194,28 @@ intents.message_content = True  # must also be switched on in the Developer Port
 bot = discord.Client(intents=intents)
 
 
+def is_image(a: discord.Attachment) -> bool:
+    return (a.content_type or "").startswith("image/")
+
+
 def clean(msg: discord.Message) -> str:
     """Turn a Discord message into readable text (mentions become @Name)."""
     text = msg.clean_content.strip()
-    if msg.attachments:
-        text += " [shared an attachment]"
+    for a in msg.attachments:
+        text += " [shared an image]" if is_image(a) else " [shared a file]"
     return text or "[empty message]"
+
+
+def image_urls(*messages) -> list[str]:
+    """Links to pictures in these messages (the AI fetches them, not this server)."""
+    if not IMAGES:
+        return []
+    urls = []
+    for m in messages:
+        for a in getattr(m, "attachments", None) or []:
+            if is_image(a) and a.size <= MAX_IMAGE_MB * 1024 * 1024:
+                urls.append(a.url)
+    return urls[:MAX_IMAGES]
 
 
 class Memory:
@@ -230,7 +278,19 @@ class Memory:
         return "\n".join(lines)
 
 
-memory = Memory(MEMORY_FILE) if MEMORY else None
+store = Memory(MEMORY_FILE)  # also holds personas and /reset points
+memory = store if MEMORY else None
+
+
+def system_for(key: str) -> str:
+    persona = store.chat(key).get("persona")
+    if not persona:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT + (
+        f" For fun, the group has asked you to talk like {persona['style']}. Commit to the "
+        f"bit, but you're still {BOT_NAME}: it's an impression, so never claim to really be "
+        "anyone, and keep replies short and friendly."
+    )
 
 
 def chat_key(channel) -> str:
@@ -239,7 +299,10 @@ def chat_key(channel) -> str:
 
 
 async def build_transcript(channel) -> str:
-    history = [m async for m in channel.history(limit=HISTORY_LIMIT)]
+    reset = store.chat(chat_key(channel)).get("reset_at", {}).get(str(channel.id))
+    after = datetime.fromisoformat(reset) if reset else None
+    history = [m async for m in channel.history(limit=HISTORY_LIMIT, after=after,
+                                                 oldest_first=False)]
     history.reverse()  # oldest first
     lines = []
     if memory:
@@ -340,11 +403,16 @@ def build_prompt(transcript: str, key: str) -> str:
     return transcript
 
 
-async def ask(transcript: str, key: str) -> str:
+async def ask(transcript: str, key: str, images: list[str] = ()) -> str:
     prompt = build_prompt(transcript, key)
+    if images:
+        prompt += f"\n\n(The {len(images)} image(s) attached are from the latest messages.)"
     if PROVIDER == "groq":
-        return await ask_groq(prompt, key)
-    return await ask_claude(prompt, key)
+        return await ask_groq(prompt, key, list(images))
+    return await ask_claude(prompt, key, list(images))
+
+
+THINK = re.compile(r"<think>.*?</think>|\s*【[^】]*】", re.S)  # reasoning text, citation marks
 
 
 class GroqFailed(Exception):
@@ -417,9 +485,17 @@ async def groq_search(query: str, sources: list) -> str:
     return answer or "No results found."
 
 
-async def ask_groq(prompt: str, key: str) -> str:
-    """Groq's free API (OpenAI-style), with memory tools and web search."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+async def ask_groq(prompt: str, key: str, images: list[str]) -> str:
+    """Groq's free API (OpenAI-style), with memory tools, web search and images."""
+    def user_turn(with_images: bool):
+        if not with_images:
+            note = "\n(Someone shared an image you couldn't open this time.)" if images else ""
+            return {"role": "user", "content": prompt + note}
+        return {"role": "user", "content": [{"type": "text", "text": prompt}] + [
+            {"type": "image_url", "image_url": {"url": u}} for u in images]}
+
+    messages = [{"role": "system", "content": system_for(key)}, user_turn(bool(images))]
+    models = [GROQ_VISION_MODEL] if images else [GROQ_MODEL, GROQ_FALLBACK_MODEL]
     body = {"max_tokens": 1024}
     tools = [GROQ_SEARCH_TOOL] if WEB_BROWSING else []
     if memory:
@@ -435,8 +511,14 @@ async def ask_groq(prompt: str, key: str) -> str:
 
     for _ in range(5):
         try:
-            msg = await groq_call({**body, "messages": messages}, [GROQ_MODEL, GROQ_FALLBACK_MODEL])
+            msg = await groq_call({**body, "messages": messages}, models)
         except GroqFailed as e:
+            if images and models == [GROQ_VISION_MODEL] and str(e) != "key":
+                # The vision model failed: answer without the picture instead.
+                log.warning("Groq vision model failed (%s); answering without images", e)
+                messages[1] = user_turn(False)
+                models = [GROQ_MODEL, GROQ_FALLBACK_MODEL]
+                continue
             if str(e) == "key":
                 log.error("Groq API key is wrong. Check GROQ_API_KEY in .env")
                 return "My Groq key isn't working. Ask whoever runs me to check it."
@@ -445,7 +527,7 @@ async def ask_groq(prompt: str, key: str) -> str:
             return "Something went wrong on my end. Try again later."
         calls = msg.get("tool_calls") or []
         if not calls:
-            text = re.sub(r"\s*【[^】]*】", "", msg.get("content") or "").strip()
+            text = THINK.sub("", msg.get("content") or "").strip()
             if not text:
                 return "🤔"
             if sources:
@@ -470,13 +552,14 @@ async def ask_groq(prompt: str, key: str) -> str:
     return "👍"
 
 
-async def ask_claude(prompt: str, key: str) -> str:
-    messages = [{"role": "user", "content": prompt}]
+async def ask_claude(prompt: str, key: str, images: list[str]) -> str:
+    content = [{"type": "image", "source": {"type": "url", "url": u}} for u in images]
+    messages = [{"role": "user", "content": content + [{"type": "text", "text": prompt}]}]
     tools = (WEB_TOOLS if WEB_BROWSING else []) + (MEMORY_TOOLS if memory else [])
     request = dict(
         model=MODEL,
         max_tokens=2048,
-        system=SYSTEM_PROMPT,
+        system=system_for(key),
         output_config={"effort": "low"},  # chat doesn't need deep thinking; keeps it cheap and fast
     )
     if tools:
@@ -551,12 +634,159 @@ def is_for_me(msg: discord.Message) -> bool:
     return isinstance(ref, discord.Message) and ref.author == bot.user
 
 
+async def answer(transcript: str, key: str, images: list[str] = ()) -> str:
+    """Get a reply, turning any failure into a friendly message."""
+    try:
+        return await ask(transcript, key, images)
+    except anthropic.BadRequestError as e:
+        if images:
+            log.warning("Claude couldn't use the image(s): %s; retrying without", e.message)
+            return await answer(transcript + "\n(Someone shared an image you couldn't open.)", key)
+        log.error("Claude API error %s: %s", e.status_code, e.message)
+        return "Something went wrong on my end. Try again later."
+    except anthropic.RateLimitError:
+        log.warning("Rate limited by the Claude API")
+        return "I'm getting a lot of messages right now. Try me again in a minute."
+    except anthropic.AuthenticationError:
+        log.error("Claude API key is missing or wrong. Check ANTHROPIC_API_KEY in .env")
+        return "My API key isn't working. Ask whoever runs me to check it."
+    except anthropic.APIStatusError as e:
+        log.error("Claude API error %s: %s", e.status_code, e.message)
+        return "Something went wrong on my end (maybe out of API credit?). Try again later."
+    except anthropic.APIConnectionError:
+        log.exception("Couldn't reach the Claude API")
+        return "I can't reach my brain right now. Try again in a moment."
+    except Exception:
+        log.exception("Unexpected error while answering")
+        return "Oops, something broke on my side. Try again?"
+
+
+# ---- Slash commands -----------------------------------------------------
+tree = app_commands.CommandTree(bot)
+synced_guilds: set[int] = set()
+
+
+async def sync_commands(guild: discord.Guild):
+    """Register the slash commands in a server (shows up straight away)."""
+    if guild.id in synced_guilds:
+        return
+    try:
+        tree.copy_global_to(guild=guild)
+        await tree.sync(guild=guild)
+        synced_guilds.add(guild.id)
+        log.info("Slash commands ready in %s", guild.name)
+    except discord.Forbidden:
+        log.error("Can't add slash commands in %s. Re-invite the bot with the "
+                  "applications.commands scope (see README).", guild.name)
+
+
+async def send_chunks(interaction: discord.Interaction, text: str, ephemeral: bool = False):
+    for chunk in split_for_discord(shorten_links(text)):
+        await interaction.followup.send(chunk, ephemeral=ephemeral)
+
+
+persona = app_commands.Group(name="persona", description=f"Change how {BOT_NAME} talks")
+
+
+@persona.command(name="pick", description="Pick a fun speaking style")
+@app_commands.describe(style="The style to use")
+@app_commands.choices(style=[app_commands.Choice(name=label, value=k)
+                             for k, (label, _) in PERSONAS.items()])
+async def persona_pick(interaction: discord.Interaction, style: app_commands.Choice[str]):
+    label, desc = PERSONAS[style.value]
+    store.chat(chat_key(interaction.channel))["persona"] = {"name": label, "style": desc}
+    store.save()
+    await interaction.response.send_message(f"🎭 {BOT_NAME} is now: **{label}**. "
+                                            "Use `/persona default` to switch back.")
+
+
+@persona.command(name="custom", description="Describe your own speaking style")
+@app_commands.describe(description="e.g. a grumpy cat who secretly loves everyone")
+async def persona_custom(interaction: discord.Interaction, description: str):
+    description = description.strip()[:MAX_CUSTOM_PERSONA_CHARS]
+    store.chat(chat_key(interaction.channel))["persona"] = {"name": description, "style": description}
+    store.save()
+    await interaction.response.send_message(f"🎭 {BOT_NAME} will now talk like: *{description}*. "
+                                            "Use `/persona default` to switch back.")
+
+
+@persona.command(name="default", description=f"Go back to normal {BOT_NAME}")
+async def persona_default(interaction: discord.Interaction):
+    store.chat(chat_key(interaction.channel)).pop("persona", None)
+    store.save()
+    await interaction.response.send_message(f"🙂 Back to plain old {BOT_NAME}.")
+
+
+@persona.command(name="show", description="See which style is on")
+async def persona_show(interaction: discord.Interaction):
+    p = store.chat(chat_key(interaction.channel)).get("persona")
+    await interaction.response.send_message(
+        f"🎭 Current style: **{p['name']}**" if p else f"🙂 Just plain {BOT_NAME} right now.",
+        ephemeral=True)
+
+
+tree.add_command(persona)
+
+
+@tree.command(name="ask", description=f"Ask {BOT_NAME} something")
+@app_commands.describe(question="Your question", image="Optional picture to look at")
+async def ask_command(interaction: discord.Interaction, question: str,
+                      image: discord.Attachment | None = None):
+    await interaction.response.defer(thinking=True)
+    channel = interaction.channel
+    transcript = await build_transcript(channel) if channel else ""
+    transcript += f"\n{interaction.user.display_name}: @{BOT_NAME} {question}"
+    if image and is_image(image):
+        transcript += " [shared an image]"
+    images = image_urls(NamedAttachments([image])) if image else []
+    reply = await answer(transcript.strip(), chat_key(channel), images)
+    await send_chunks(interaction, f"> {question[:300]}\n{reply}")
+
+
+class NamedAttachments:
+    """Lets image_urls() read a slash-command attachment like a message's."""
+
+    def __init__(self, attachments):
+        self.attachments = attachments
+
+
+@tree.command(name="reset", description=f"Make {BOT_NAME} forget things")
+@app_commands.describe(what="What to forget")
+@app_commands.choices(what=[
+    app_commands.Choice(name="The conversation so far (in this channel)", value="chat"),
+    app_commands.Choice(name="Saved names and facts", value="memory"),
+    app_commands.Choice(name="Everything, including the persona", value="everything"),
+])
+async def reset_command(interaction: discord.Interaction, what: app_commands.Choice[str]):
+    chat = store.chat(chat_key(interaction.channel))
+    if what.value in ("chat", "everything"):
+        now = datetime.now(timezone.utc).isoformat()
+        chat.setdefault("reset_at", {})[str(interaction.channel_id)] = now
+    if what.value in ("memory", "everything"):
+        chat["people"], chat["facts"] = {}, {}
+    if what.value == "everything":
+        chat.pop("persona", None)
+    store.save()
+    done = {"chat": "Fresh start: I'll ignore everything said here before now.",
+            "memory": "Done: I've forgotten the names and facts I'd saved.",
+            "everything": "Clean slate: conversation, saved facts and persona all reset."}
+    await interaction.response.send_message(f"🧹 {done[what.value]}")
+
+
 @bot.event
 async def on_ready():
-    log.info("Logged in as %s. AI: %s. Web browsing is %s. Memory is %s.", bot.user,
-             f"Groq ({GROQ_MODEL}, backup {GROQ_FALLBACK_MODEL})" if PROVIDER == "groq"
-             else f"Claude ({MODEL})",
-             "on" if WEB_BROWSING else "off", f"on ({MEMORY_FILE})" if memory else "off")
+    log.info("Logged in as %s. AI: %s. Web browsing is %s. Memory is %s. Images are %s.", bot.user,
+             f"Groq ({GROQ_MODEL}, backup {GROQ_FALLBACK_MODEL}, images {GROQ_VISION_MODEL})"
+             if PROVIDER == "groq" else f"Claude ({MODEL})",
+             "on" if WEB_BROWSING else "off", f"on ({MEMORY_FILE})" if memory else "off",
+             "on" if IMAGES else "off")
+    for guild in bot.guilds:
+        await sync_commands(guild)
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    await sync_commands(guild)
 
 
 @bot.event
@@ -564,25 +794,15 @@ async def on_message(msg: discord.Message):
     if msg.author.bot or not is_for_me(msg):
         return
 
-    try:
-        async with msg.channel.typing():
+    ref = msg.reference.resolved if msg.reference else None
+    images = image_urls(msg, ref if isinstance(ref, discord.Message) else None)
+    async with msg.channel.typing():
+        try:
             transcript = await build_transcript(msg.channel)
-            reply = await ask(transcript, chat_key(msg.channel))
-    except anthropic.RateLimitError:
-        log.warning("Rate limited by the Claude API")
-        reply = "I'm getting a lot of messages right now. Try me again in a minute."
-    except anthropic.AuthenticationError:
-        log.error("Claude API key is missing or wrong. Check ANTHROPIC_API_KEY in .env")
-        reply = "My API key isn't working. Ask whoever runs me to check it."
-    except anthropic.APIStatusError as e:
-        log.error("Claude API error %s: %s", e.status_code, e.message)
-        reply = "Something went wrong on my end (maybe out of API credit?). Try again later."
-    except anthropic.APIConnectionError:
-        log.exception("Couldn't reach the Claude API")
-        reply = "I can't reach my brain right now. Try again in a moment."
-    except Exception:
-        log.exception("Unexpected error while answering")
-        reply = "Oops, something broke on my side. Try again?"
+        except Exception:
+            log.exception("Couldn't read the channel history")
+            transcript = f"{msg.author.display_name}: {clean(msg)}"
+        reply = await answer(transcript, chat_key(msg.channel), images)
 
     chunks = split_for_discord(shorten_links(reply))
     await msg.reply(chunks[0], mention_author=False)
