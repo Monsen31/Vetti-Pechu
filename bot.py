@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+from urllib.parse import unquote, urlparse
 from pathlib import Path
 
 import anthropic
@@ -137,6 +138,11 @@ GROQ_SEARCH_TOOL = {
     },
 }
 
+SYSTEM_PROMPT += (
+    " If you share a link, write it as a Discord masked link with a few words, "
+    "like [BBC match report](https://...), never as a bare URL."
+)
+
 DISCORD_MAX_CHARS = 2000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -247,15 +253,59 @@ async def build_transcript(channel) -> str:
     return "\n".join(lines)
 
 
-def source_links(content) -> list[str]:
+def short_label(url: str, title: str | None = None, max_words: int = 6) -> str:
+    """A few readable words for a link: the page title if known, else from the URL."""
+    words = []
+    if title:
+        title = re.split(r"\s+[|\-–—]\s+", title.strip())[0]  # drop " - Site Name"
+        words = title.split()
+    if not words:
+        parsed = urlparse(url)
+        site = parsed.netloc.lower().removeprefix("www.")
+        slug = [p for p in unquote(parsed.path).split("/") if p and not p.isdigit()]
+        slug_words = re.split(r"[-_+.]+", slug[-1]) if slug else []
+        slug_words = [w for w in slug_words if w and not w.isdigit() and w.lower() not in ("html", "htm", "php")]
+        words = [site + (":" if slug_words else "")] + slug_words
+    label = " ".join(words[:max_words]) + ("…" if len(words) > max_words else "")
+    return re.sub(r"[\[\]()<>`*_~|]", "", label).strip() or "link"
+
+
+def masked(url: str, title: str | None = None) -> str:
+    # <...> stops Discord from showing a big preview for each link.
+    return f"[{short_label(url, title)}](<{url}>)"
+
+
+def format_sources(sources: list[tuple[str, str | None]]) -> str:
+    return "\n-# Sources: " + " · ".join(masked(u, t) for u, t in sources[:MAX_SOURCES])
+
+
+MD_LINK = re.compile(r"\[([^\]]+)\]\(<?(https?://[^\s)>]+)>?\)")
+BARE_URL = re.compile(r"<?(https?://[^\s<>]+[^\s<>.,;:!?)\]'\"])>?")
+
+
+def shorten_links(text: str) -> str:
+    """Turn bare URLs into a few hyperlinked words and stop link previews."""
+    keep = []
+
+    def stash(m):
+        label = re.sub(r"https?://\S+", "", m.group(1)).strip() or short_label(m.group(2))
+        keep.append(f"[{label}](<{m.group(2)}>)")
+        return f"\x00{len(keep) - 1}\x00"
+
+    text = MD_LINK.sub(stash, text)  # existing masked links: keep their words
+    text = BARE_URL.sub(lambda m: masked(m.group(1)), text)
+    return re.sub(r"\x00(\d+)\x00", lambda m: keep[int(m.group(1))], text)
+
+
+def source_links(content) -> list[tuple[str, str | None]]:
     """Collect the web pages Claude cited, so friends can check them."""
-    urls = []
+    found = {}
     for block in content:
         for c in getattr(block, "citations", None) or []:
             url = getattr(c, "url", None)
-            if url and url not in urls:
-                urls.append(url)
-    return urls[:MAX_SOURCES]
+            if url and url not in found:
+                found[url] = getattr(c, "title", None)
+    return list(found.items())[:MAX_SOURCES]
 
 
 def add_assistant(messages: list, content) -> None:
@@ -329,22 +379,24 @@ async def groq_call(body: dict, models: list[str]) -> dict:
     raise GroqFailed(last or "error")
 
 
-def find_urls(obj, found=None) -> list[str]:
-    """Pull any web addresses out of Groq's tool output, whatever its shape."""
-    found = [] if found is None else found
+def find_links(obj, found=None) -> dict:
+    """Pull web addresses (and titles) out of Groq's tool output, whatever its shape."""
+    found = {} if found is None else found
     if isinstance(obj, dict):
+        url = obj.get("url")
+        if isinstance(url, str) and url.startswith("http") and url not in found:
+            title = obj.get("title")
+            found[url] = title if isinstance(title, str) else None
         for k, v in obj.items():
-            if k == "url" and isinstance(v, str) and v.startswith("http") and v not in found:
-                found.append(v)
-            else:
-                find_urls(v, found)
+            if k != "url":
+                find_links(v, found)
     elif isinstance(obj, list):
         for v in obj:
-            find_urls(v, found)
+            find_links(v, found)
     return found
 
 
-async def groq_search(query: str, sources: list[str]) -> str:
+async def groq_search(query: str, sources: list) -> str:
     """Run one web search with Groq's built-in browser search."""
     body = {
         "messages": [{"role": "user", "content":
@@ -357,9 +409,9 @@ async def groq_search(query: str, sources: list[str]) -> str:
     except GroqFailed as e:
         log.warning("Groq web search failed (%s)", e)
         return "Web search isn't available right now. Answer from what you know and say you couldn't check."
-    for url in find_urls(msg.get("executed_tools")):
-        if url not in sources:
-            sources.append(url)
+    for url, title in find_links(msg.get("executed_tools")).items():
+        if url not in [u for u, _ in sources]:
+            sources.append((url, title))
     answer = re.sub(r"\s*【[^】]*】", "", msg.get("content") or "").strip()  # drop citation markers
     log.info("Groq web search: %r", query)
     return answer or "No results found."
@@ -378,7 +430,7 @@ async def ask_groq(prompt: str, key: str) -> str:
         ]
     if tools:
         body["tools"] = tools
-    sources: list[str] = []
+    sources: list[tuple[str, str | None]] = []
     searches = 0
 
     for _ in range(5):
@@ -397,7 +449,7 @@ async def ask_groq(prompt: str, key: str) -> str:
             if not text:
                 return "🤔"
             if sources:
-                text += "\n-# Sources: " + " · ".join(f"<{u}>" for u in sources[:MAX_SOURCES])
+                text += format_sources(sources)
             return text
         messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
         for call in calls:
@@ -465,8 +517,7 @@ async def ask_claude(prompt: str, key: str) -> str:
         return "👍" if any(b.type == "tool_use" for b in content) else "🤔"
     sources = source_links(content)
     if sources:
-        # <...> stops Discord from showing a big preview for each link.
-        text += "\n-# Sources: " + " · ".join(f"<{u}>" for u in sources)
+        text += format_sources(sources)
     return text
 
 
@@ -533,7 +584,7 @@ async def on_message(msg: discord.Message):
         log.exception("Unexpected error while answering")
         reply = "Oops, something broke on my side. Try again?"
 
-    chunks = split_for_discord(reply)
+    chunks = split_for_discord(shorten_links(reply))
     await msg.reply(chunks[0], mention_author=False)
     for extra in chunks[1:]:
         await msg.channel.send(extra)
