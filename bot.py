@@ -7,8 +7,10 @@ messages). It reads the last few messages in the channel so it can follow
 the conversation.
 """
 
+import json
 import logging
 import os
+from pathlib import Path
 
 import anthropic
 import discord
@@ -63,6 +65,53 @@ MAX_SOURCES = 3
 # Also reply when someone pings @everyone or @here.
 REPLY_TO_EVERYONE = os.getenv("REPLY_TO_EVERYONE", "on").lower() in ("on", "true", "yes", "1")
 
+# Long-term memory: names and facts saved to a small JSON file next to bot.py.
+MEMORY = os.getenv("MEMORY", "on").lower() in ("on", "true", "yes", "1")
+MEMORY_FILE = Path(os.getenv("MEMORY_FILE", Path(__file__).with_name("memory.json")))
+MAX_FACTS_PER_PERSON = 15
+MAX_FACT_CHARS = 200
+
+if MEMORY:
+    SYSTEM_PROMPT += (
+        " You have a long-term memory. Before the chat you'll see who is in the group "
+        "and what you remember about them. When someone shares something worth "
+        "remembering about a person (nicknames, likes, birthdays, jobs, plans, running "
+        "jokes), save it with the remember tool, and use forget when asked to or when "
+        "a fact is out of date. Don't save small talk. Don't announce that you saved "
+        "something unless it fits naturally."
+    )
+
+MEMORY_TOOLS = [
+    {
+        "name": "remember",
+        "description": "Save a lasting fact about a person in this group chat.",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "person": {"type": "string", "description": "The person's display name as shown in the chat"},
+                "fact": {"type": "string", "description": "One short fact, e.g. 'supports Arsenal'"},
+            },
+            "required": ["person", "fact"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "forget",
+        "description": "Remove a saved fact about a person.",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "person": {"type": "string", "description": "The person's display name"},
+                "fact": {"type": "string", "description": "Words from the fact to remove"},
+            },
+            "required": ["person", "fact"],
+            "additionalProperties": False,
+        },
+    },
+]
+
 DISCORD_MAX_CHARS = 2000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -84,10 +133,83 @@ def clean(msg: discord.Message) -> str:
     return text or "[empty message]"
 
 
+class Memory:
+    """A tiny JSON store: per chat, who's who and facts about each person."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.data = {}
+        if path.exists():
+            try:
+                self.data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                log.exception("Couldn't read %s; starting with empty memory", path)
+
+    def save(self):
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, indent=1, ensure_ascii=False))
+        os.replace(tmp, self.path)  # never leaves a half-written file
+
+    def chat(self, key: str) -> dict:
+        return self.data.setdefault(key, {"people": {}, "facts": {}})
+
+    def see(self, key: str, member) -> bool:
+        """Record a person's current name. Returns True if anything changed."""
+        people = self.chat(key)["people"]
+        entry = {"name": member.display_name, "username": member.name}
+        if people.get(str(member.id)) == entry:
+            return False
+        people[str(member.id)] = entry
+        return True
+
+    def remember(self, key: str, person: str, fact: str) -> str:
+        facts = self.chat(key)["facts"].setdefault(person.strip(), [])
+        fact = fact.strip()[:MAX_FACT_CHARS]
+        if fact and fact not in facts:
+            facts.append(fact)
+            del facts[:-MAX_FACTS_PER_PERSON]  # keep the newest
+            self.save()
+        return f"Saved: {person}: {fact}"
+
+    def forget(self, key: str, person: str, fact: str) -> str:
+        facts = self.chat(key)["facts"].get(person.strip(), [])
+        keep = [f for f in facts if fact.lower() not in f.lower()]
+        removed = len(facts) - len(keep)
+        if removed:
+            self.chat(key)["facts"][person.strip()] = keep
+            self.save()
+        return f"Removed {removed} fact(s) about {person}."
+
+    def summary(self, key: str) -> str:
+        chat = self.chat(key)
+        lines = []
+        if chat["people"]:
+            names = ", ".join(f"{p['name']} (@{p['username']})" for p in chat["people"].values())
+            lines.append(f"People in this chat: {names}")
+        facts = [(who, f) for who, fs in chat["facts"].items() for f in fs]
+        if facts:
+            lines.append("What you remember:")
+            lines += [f"- {who}: {f}" for who, f in facts]
+        return "\n".join(lines)
+
+
+memory = Memory(MEMORY_FILE) if MEMORY else None
+
+
+def chat_key(channel) -> str:
+    guild = getattr(channel, "guild", None)
+    return f"server-{guild.id}" if guild else f"dm-{channel.id}"
+
+
 async def build_transcript(channel) -> str:
     history = [m async for m in channel.history(limit=HISTORY_LIMIT)]
     history.reverse()  # oldest first
     lines = []
+    if memory:
+        key = chat_key(channel)
+        changed = [memory.see(key, m.author) for m in history if not m.author.bot]
+        if any(changed):
+            memory.save()
     for m in history:
         name = BOT_NAME if m.author == bot.user else m.author.display_name
         lines.append(f"{name}: {clean(m)}")
@@ -105,26 +227,62 @@ def source_links(content) -> list[str]:
     return urls[:MAX_SOURCES]
 
 
-async def ask_claude(transcript: str) -> str:
-    messages = [{"role": "user", "content": transcript}]
+def add_assistant(messages: list, content) -> None:
+    """Append Claude's turn, merging with the last one if it was also Claude's."""
+    if messages[-1]["role"] == "assistant":
+        messages[-1]["content"] = list(messages[-1]["content"]) + list(content)
+    else:
+        messages.append({"role": "assistant", "content": list(content)})
+
+
+def run_memory_tool(key: str, block) -> dict:
+    args = block.input if isinstance(block.input, dict) else {}
+    person, fact = str(args.get("person", "")), str(args.get("fact", ""))
+    if not memory or not person or not fact:
+        result, error = "Missing person or fact.", True
+    elif block.name == "remember":
+        result, error = memory.remember(key, person, fact), False
+    elif block.name == "forget":
+        result, error = memory.forget(key, person, fact), False
+    else:
+        result, error = f"Unknown tool {block.name}", True
+    log.info("Memory %s: %s", block.name, result)
+    return {"type": "tool_result", "tool_use_id": block.id, "content": result, "is_error": error}
+
+
+async def ask_claude(transcript: str, key: str) -> str:
+    prompt = transcript
+    if memory:
+        known = memory.summary(key)
+        if known:
+            prompt = f"<memory>\n{known}\n</memory>\n\nRecent chat:\n{transcript}"
+    messages = [{"role": "user", "content": prompt}]
+    tools = (WEB_TOOLS if WEB_BROWSING else []) + (MEMORY_TOOLS if memory else [])
     request = dict(
         model=MODEL,
         max_tokens=2048,
         system=SYSTEM_PROMPT,
         output_config={"effort": "low"},  # chat doesn't need deep thinking; keeps it cheap and fast
     )
-    if WEB_BROWSING:
-        request["tools"] = WEB_TOOLS
+    if tools:
+        request["tools"] = tools
 
-    response = await claude.messages.create(messages=messages, **request)
-    content = list(response.content)
-    # A long web lookup can pause partway; send it back so it can carry on.
-    for _ in range(3):
-        if response.stop_reason != "pause_turn":
-            break
-        resume = messages + [{"role": "assistant", "content": content}]
-        response = await claude.messages.create(messages=resume, **request)
+    texts, content = [], []
+    for _ in range(6):  # a few rounds at most: web lookups and memory saves
+        response = await claude.messages.create(messages=messages, **request)
         content += response.content
+        text = "".join(b.text for b in response.content if b.type == "text").strip()
+        if text:
+            texts.append(text)
+        if response.stop_reason == "pause_turn":
+            # A long web lookup paused partway; send it back so it can carry on.
+            add_assistant(messages, response.content)
+        elif response.stop_reason == "tool_use":
+            add_assistant(messages, response.content)
+            results = [run_memory_tool(key, b) for b in response.content if b.type == "tool_use"]
+            messages.append({"role": "user", "content": results})
+        else:
+            break
 
     usage = response.usage
     searches = getattr(getattr(usage, "server_tool_use", None), "web_search_requests", 0) or 0
@@ -133,10 +291,10 @@ async def ask_claude(transcript: str) -> str:
 
     if response.stop_reason == "refusal":
         return "I'd rather not weigh in on that one."
-    # Keep only the text (the reply can also hold thinking and web results).
-    text = "".join(b.text for b in content if b.type == "text").strip()
+    # Keep only the text (the reply can also hold thinking, web results and tool calls).
+    text = "\n".join(texts).strip()
     if not text:
-        return "🤔"
+        return "👍" if any(b.type == "tool_use" for b in content) else "🤔"
     sources = source_links(content)
     if sources:
         # <...> stops Discord from showing a big preview for each link.
@@ -176,7 +334,8 @@ def is_for_me(msg: discord.Message) -> bool:
 
 @bot.event
 async def on_ready():
-    log.info("Logged in as %s. Web browsing is %s.", bot.user, "on" if WEB_BROWSING else "off")
+    log.info("Logged in as %s. Web browsing is %s. Memory is %s.", bot.user,
+             "on" if WEB_BROWSING else "off", f"on ({MEMORY_FILE})" if memory else "off")
 
 
 @bot.event
@@ -187,7 +346,7 @@ async def on_message(msg: discord.Message):
     try:
         async with msg.channel.typing():
             transcript = await build_transcript(msg.channel)
-            reply = await ask_claude(transcript)
+            reply = await ask_claude(transcript, chat_key(msg.channel))
     except anthropic.RateLimitError:
         log.warning("Rate limited by the Claude API")
         reply = "I'm getting a lot of messages right now. Try me again in a minute."
