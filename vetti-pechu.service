@@ -2,6 +2,8 @@
 Description=Vetti Pechu Discord bot (Claude)
 After=network-online.target
 Wants=network-online.target
+# Never stop retrying, even after many restarts in a row
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -11,6 +13,8 @@ EnvironmentFile=/home/ubuntu/vetti-pechu/.env
 ExecStart=/home/ubuntu/vetti-pechu/venv/bin/python bot.py
 Restart=always
 RestartSec=10
+# Ask the kernel to kill other things before the bot if memory runs out
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target

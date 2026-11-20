@@ -123,6 +123,11 @@ async def ask_claude(transcript: str) -> str:
         response = await claude.messages.create(messages=resume, **request)
         content += response.content
 
+    usage = response.usage
+    searches = getattr(getattr(usage, "server_tool_use", None), "web_search_requests", 0) or 0
+    log.info("Reply: stop=%s in=%s out=%s searches=%s",
+             response.stop_reason, usage.input_tokens, usage.output_tokens, searches)
+
     if response.stop_reason == "refusal":
         return "I'd rather not weigh in on that one."
     # Keep only the text (the reply can also hold thinking and web results).
@@ -182,6 +187,9 @@ async def on_message(msg: discord.Message):
     except anthropic.APIConnectionError:
         log.exception("Couldn't reach the Claude API")
         reply = "I can't reach my brain right now. Try again in a moment."
+    except Exception:
+        log.exception("Unexpected error while answering")
+        reply = "Oops, something broke on my side. Try again?"
 
     chunks = split_for_discord(reply)
     await msg.reply(chunks[0], mention_author=False)
