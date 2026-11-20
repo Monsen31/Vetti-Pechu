@@ -10,6 +10,7 @@ the conversation.
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import anthropic
@@ -21,19 +22,22 @@ load_dotenv()  # reads the .env file next to this script
 
 # ---- Settings (change these in .env, not here) -------------------------
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-# Which AI answers: "claude" (default) or "groq" (free tier, no web browsing).
+# Which AI answers: "claude" (default) or "groq" (free tier).
 PROVIDER = os.getenv("PROVIDER", "claude").strip().lower()
 MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+# Used if the main Groq model fails or hits its limit.
+GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
+# Groq's built-in browser search only works on its gpt-oss models.
+GROQ_SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "openai/gpt-oss-120b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 BOT_NAME = os.getenv("BOT_NAME", "Vetti Pechu")
 
 # Web browsing: lets the bot search the web and read pages for fresh info.
-# Each web search costs $0.01 (on top of tokens), so the caps keep it cheap.
+# With Claude each web search costs $0.01 (on top of tokens), so the caps keep it cheap.
 WEB_BROWSING = os.getenv("WEB_BROWSING", "on").lower() in ("on", "true", "yes", "1")
-WEB_BROWSING = WEB_BROWSING and PROVIDER == "claude"  # web tools are Claude-only
 WEB_MAX_SEARCHES = int(os.getenv("WEB_MAX_SEARCHES", "3"))  # per reply
 WEB_MAX_PAGE_READS = int(os.getenv("WEB_MAX_PAGE_READS", "2"))  # per reply
 
@@ -118,6 +122,20 @@ MEMORY_TOOLS = [
         },
     },
 ]
+
+GROQ_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Search the web for current information (news, scores, prices, "
+                       "weather, recent events, or anything that may have changed).",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "What to look up"}},
+            "required": ["query"],
+        },
+    },
+}
 
 DISCORD_MAX_CHARS = 2000
 
@@ -279,43 +297,123 @@ async def ask(transcript: str, key: str) -> str:
     return await ask_claude(prompt, key)
 
 
+class GroqFailed(Exception):
+    pass
+
+
+async def groq_call(body: dict, models: list[str]) -> dict:
+    """Call Groq, trying each model in turn. Returns the response message."""
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    last = None
+    for model in dict.fromkeys(m for m in models if m):  # unique, in order
+        payload = {**body, "model": model}
+        if model.startswith("openai/gpt-oss"):
+            payload["reasoning_effort"] = "low"  # chat doesn't need deep thinking
+        try:
+            r = await groq.post(GROQ_URL, json=payload, headers=headers)
+        except httpx.HTTPError as e:
+            log.warning("Groq %s unreachable: %s", model, e)
+            last = "unreachable"
+            continue
+        if r.status_code == 401:
+            raise GroqFailed("key")
+        if r.status_code >= 400:
+            log.warning("Groq %s error %s: %s", model, r.status_code, r.text[:300])
+            last = "limit" if r.status_code == 429 else "error"
+            continue
+        data = r.json()
+        usage = data.get("usage", {})
+        log.info("Reply (groq %s): in=%s out=%s", model,
+                 usage.get("prompt_tokens"), usage.get("completion_tokens"))
+        return data["choices"][0]["message"]
+    raise GroqFailed(last or "error")
+
+
+def find_urls(obj, found=None) -> list[str]:
+    """Pull any web addresses out of Groq's tool output, whatever its shape."""
+    found = [] if found is None else found
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "url" and isinstance(v, str) and v.startswith("http") and v not in found:
+                found.append(v)
+            else:
+                find_urls(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            find_urls(v, found)
+    return found
+
+
+async def groq_search(query: str, sources: list[str]) -> str:
+    """Run one web search with Groq's built-in browser search."""
+    body = {
+        "messages": [{"role": "user", "content":
+                      f"Search the web and give a short factual answer with key details: {query}"}],
+        "tools": [{"type": "browser_search"}],
+        "max_tokens": 1024,
+    }
+    try:
+        msg = await groq_call(body, [GROQ_SEARCH_MODEL, "openai/gpt-oss-20b"])
+    except GroqFailed as e:
+        log.warning("Groq web search failed (%s)", e)
+        return "Web search isn't available right now. Answer from what you know and say you couldn't check."
+    for url in find_urls(msg.get("executed_tools")):
+        if url not in sources:
+            sources.append(url)
+    answer = re.sub(r"\s*【[^】]*】", "", msg.get("content") or "").strip()  # drop citation markers
+    log.info("Groq web search: %r", query)
+    return answer or "No results found."
+
+
 async def ask_groq(prompt: str, key: str) -> str:
-    """Groq's free API (OpenAI-style). Supports memory tools, not web browsing."""
+    """Groq's free API (OpenAI-style), with memory tools and web search."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
-    body = {"model": GROQ_MODEL, "max_tokens": 1024, "temperature": 0.8}
+    body = {"max_tokens": 1024}
+    tools = [GROQ_SEARCH_TOOL] if WEB_BROWSING else []
     if memory:
-        body["tools"] = [
+        tools += [
             {"type": "function", "function": {
                 "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
             for t in MEMORY_TOOLS
         ]
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    if tools:
+        body["tools"] = tools
+    sources: list[str] = []
+    searches = 0
 
-    for _ in range(4):
-        r = await groq.post(GROQ_URL, json={**body, "messages": messages}, headers=headers)
-        if r.status_code == 429:
-            log.warning("Groq rate limit: %s", r.text[:300])
-            return "I've hit my free limit for now. Give me a minute and try again."
-        if r.status_code == 401:
-            log.error("Groq API key is wrong. Check GROQ_API_KEY in .env")
-            return "My Groq key isn't working. Ask whoever runs me to check it."
-        if r.status_code >= 400:
-            log.error("Groq error %s: %s", r.status_code, r.text[:500])
+    for _ in range(5):
+        try:
+            msg = await groq_call({**body, "messages": messages}, [GROQ_MODEL, GROQ_FALLBACK_MODEL])
+        except GroqFailed as e:
+            if str(e) == "key":
+                log.error("Groq API key is wrong. Check GROQ_API_KEY in .env")
+                return "My Groq key isn't working. Ask whoever runs me to check it."
+            if str(e) == "limit":
+                return "I've hit my free limit for now. Give me a minute and try again."
             return "Something went wrong on my end. Try again later."
-        data = r.json()
-        msg = data["choices"][0]["message"]
-        usage = data.get("usage", {})
-        log.info("Reply (groq): in=%s out=%s", usage.get("prompt_tokens"), usage.get("completion_tokens"))
         calls = msg.get("tool_calls") or []
         if not calls:
-            return (msg.get("content") or "").strip() or "🤔"
+            text = re.sub(r"\s*【[^】]*】", "", msg.get("content") or "").strip()
+            if not text:
+                return "🤔"
+            if sources:
+                text += "\n-# Sources: " + " · ".join(f"<{u}>" for u in sources[:MAX_SOURCES])
+            return text
         messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
         for call in calls:
+            name = call["function"]["name"]
             try:
                 args = json.loads(call["function"].get("arguments") or "{}")
             except ValueError:
                 args = {}
-            result, _ = run_memory_tool(key, call["function"]["name"], args)
+            if name == "web_search":
+                searches += 1
+                if searches > WEB_MAX_SEARCHES:
+                    result = "Search limit reached for this reply. Answer with what you have."
+                else:
+                    result = await groq_search(str(args.get("query", "")), sources)
+            else:
+                result, _ = run_memory_tool(key, name, args)
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
     return "👍"
 
@@ -405,7 +503,8 @@ def is_for_me(msg: discord.Message) -> bool:
 @bot.event
 async def on_ready():
     log.info("Logged in as %s. AI: %s. Web browsing is %s. Memory is %s.", bot.user,
-             f"Groq ({GROQ_MODEL})" if PROVIDER == "groq" else f"Claude ({MODEL})",
+             f"Groq ({GROQ_MODEL}, backup {GROQ_FALLBACK_MODEL})" if PROVIDER == "groq"
+             else f"Claude ({MODEL})",
              "on" if WEB_BROWSING else "off", f"on ({MEMORY_FILE})" if memory else "off")
 
 
