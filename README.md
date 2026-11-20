@@ -150,6 +150,7 @@ All settings live in `.env`. Restart the service after any change.
 - **Personality:** the default persona is a laid-back, chatty friend. To change it, uncomment `SYSTEM_PROMPT=` and write your own, e.g. `SYSTEM_PROMPT=You are Vetti Pechu, the sarcastic but kind friend in our group chat. Keep replies to one or two sentences.`
 - **Name:** defaults to Vetti Pechu. To change it, set `BOT_NAME=Jarvis` (also rename the app in the Discord Developer Portal so the display name matches).
 - **Memory:** `HISTORY_LIMIT=40` lets it read further back. More history means slightly higher cost per reply.
+- **@everyone and @here:** the bot also replies when someone pings `@everyone` or `@here`. Set `REPLY_TO_EVERYONE=off` to only reply when it is mentioned directly.
 - **Web browsing:** on by default. The bot searches the web and reads links when someone asks about news, scores, prices or anything recent, and adds its sources under the reply. Set `WEB_BROWSING=off` to turn it off. `WEB_MAX_SEARCHES` (default 3) and `WEB_MAX_PAGE_READS` (default 2) cap how much it does per reply. If it never searches, check that web search is allowed for your organisation at **console.anthropic.com > Settings**.
 - **Smarter model:** `CLAUDE_MODEL=claude-sonnet-5-5` gives noticeably better answers at roughly 20 times the cost of Haiku (still only pence a day for a small group).
 

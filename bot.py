@@ -60,6 +60,9 @@ WEB_TOOLS = [
 ]
 MAX_SOURCES = 3
 
+# Also reply when someone pings @everyone or @here.
+REPLY_TO_EVERYONE = os.getenv("REPLY_TO_EVERYONE", "on").lower() in ("on", "true", "yes", "1")
+
 DISCORD_MAX_CHARS = 2000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -156,6 +159,16 @@ def split_for_discord(text: str) -> list[str]:
 
 def is_for_me(msg: discord.Message) -> bool:
     if bot.user in msg.mentions:
+        return True
+    # Typing "@Vetti Pechu" sometimes picks the bot's role instead of the bot.
+    me = msg.guild.me if msg.guild else None
+    if me and any(role in msg.role_mentions for role in me.roles if role.managed):
+        return True
+    # mention_everyone is only set when the sender is allowed to ping everyone,
+    # so also check the text itself.
+    if REPLY_TO_EVERYONE and (
+        msg.mention_everyone or "@everyone" in msg.content or "@here" in msg.content
+    ):
         return True
     ref = msg.reference.resolved if msg.reference else None
     return isinstance(ref, discord.Message) and ref.author == bot.user
